@@ -4,6 +4,7 @@
 
 #include <limits>
 
+#include "src/counters.h"
 #include "src/heap/heap-inl.h"
 #include "src/objects-inl.h"
 #include "src/objects/js-array-buffer-inl.h"
@@ -26,8 +27,19 @@ void AddAllocationStatusSample(Isolate* isolate,
       static_cast<int>(status));
 }
 
+size_t GetAllocationLength(uint32_t size, bool require_full_guard_regions) {
+  if (require_full_guard_regions) {
+    return RoundUp(kWasmMaxHeapOffset + kNegativeGuardSize, CommitPageSize());
+  } else {
+    return RoundUp(
+        base::bits::RoundUpToPowerOfTwo32(static_cast<uint32_t>(size)),
+        kWasmPageSize);
+  }
+}
+
 void* TryAllocateBackingStore(WasmMemoryTracker* memory_tracker, Heap* heap,
-                              size_t size, void** allocation_base,
+                              size_t size, size_t max_size,
+                              void** allocation_base,
                               size_t* allocation_length) {
   using AllocationStatus = WasmMemoryTracker::AllocationStatus;
 #if V8_TARGET_ARCH_64_BIT
@@ -41,6 +53,10 @@ void* TryAllocateBackingStore(WasmMemoryTracker* memory_tracker, Heap* heap,
   // require two GCs because the first GC maybe incremental and may have
   // floating garbage.
   static constexpr int kAllocationRetries = 2;
+  // TODO(7881): do not use static_cast<uint32_t>() here
+  uint32_t reservation_size =
+      static_cast<uint32_t>((max_size > size) ? max_size : size);
+  // TODO(8898): Cleanup the allocation retry flow
   bool did_retry = false;
   for (int trial = 0;; ++trial) {
     // For guard regions, we always allocate the largest possible offset into
@@ -49,13 +65,8 @@ void* TryAllocateBackingStore(WasmMemoryTracker* memory_tracker, Heap* heap,
     //
     // To protect against 32-bit integer overflow issues, we also protect the
     // 2GiB before the valid part of the memory buffer.
-    // TODO(7881): do not use static_cast<uint32_t>() here
     *allocation_length =
-        require_full_guard_regions
-            ? RoundUp(kWasmMaxHeapOffset + kNegativeGuardSize, CommitPageSize())
-            : RoundUp(base::bits::RoundUpToPowerOfTwo32(
-                          static_cast<uint32_t>(size)),
-                      kWasmPageSize);
+        GetAllocationLength(reservation_size, require_full_guard_regions);
     DCHECK_GE(*allocation_length, size);
     DCHECK_GE(*allocation_length, kWasmPageSize);
 
@@ -66,6 +77,11 @@ void* TryAllocateBackingStore(WasmMemoryTracker* memory_tracker, Heap* heap,
     did_retry = true;
     // After first and second GC: retry.
     if (trial == kAllocationRetries) {
+      // Always reset reservation_size to initial size so that at least the
+      // initial size can be allocated if maximum size reservation is not
+      // possible.
+      reservation_size = static_cast<uint32_t>(size);
+
       // If we fail to allocate guard regions and the fallback is enabled, then
       // retry without full guard regions.
       if (require_full_guard_regions && FLAG_wasm_trap_handler_fallback) {
@@ -153,6 +169,20 @@ WasmMemoryTracker::~WasmMemoryTracker() {
   DCHECK_EQ(allocated_address_space_, 0u);
 }
 
+void* WasmMemoryTracker::TryAllocateBackingStoreForTesting(
+    Heap* heap, size_t size, void** allocation_base,
+    size_t* allocation_length) {
+  return TryAllocateBackingStore(this, heap, size, size, allocation_base,
+                                 allocation_length);
+}
+
+void WasmMemoryTracker::FreeBackingStoreForTesting(base::AddressRegion memory,
+                                                   void* buffer_start) {
+  ReleaseAllocation(nullptr, buffer_start);
+  CHECK(FreePages(GetPlatformPageAllocator(),
+                  reinterpret_cast<void*>(memory.begin()), memory.size()));
+}
+
 bool WasmMemoryTracker::ReserveAddressSpace(size_t num_bytes,
                                             ReservationLimit limit) {
   size_t reservation_limit =
@@ -179,7 +209,7 @@ void WasmMemoryTracker::RegisterAllocation(Isolate* isolate,
                                            size_t allocation_length,
                                            void* buffer_start,
                                            size_t buffer_length) {
-  base::LockGuard<base::Mutex> scope_lock(&mutex_);
+  base::MutexGuard scope_lock(&mutex_);
 
   allocated_address_space_ += allocation_length;
   AddAddressSpaceSample(isolate);
@@ -191,7 +221,7 @@ void WasmMemoryTracker::RegisterAllocation(Isolate* isolate,
 
 WasmMemoryTracker::AllocationData WasmMemoryTracker::ReleaseAllocation(
     Isolate* isolate, const void* buffer_start) {
-  base::LockGuard<base::Mutex> scope_lock(&mutex_);
+  base::MutexGuard scope_lock(&mutex_);
 
   auto find_result = allocations_.find(buffer_start);
   CHECK_NE(find_result, allocations_.end());
@@ -216,7 +246,7 @@ WasmMemoryTracker::AllocationData WasmMemoryTracker::ReleaseAllocation(
 
 const WasmMemoryTracker::AllocationData* WasmMemoryTracker::FindAllocationData(
     const void* buffer_start) {
-  base::LockGuard<base::Mutex> scope_lock(&mutex_);
+  base::MutexGuard scope_lock(&mutex_);
   const auto& result = allocations_.find(buffer_start);
   if (result != allocations_.end()) {
     return &result->second;
@@ -225,12 +255,12 @@ const WasmMemoryTracker::AllocationData* WasmMemoryTracker::FindAllocationData(
 }
 
 bool WasmMemoryTracker::IsWasmMemory(const void* buffer_start) {
-  base::LockGuard<base::Mutex> scope_lock(&mutex_);
+  base::MutexGuard scope_lock(&mutex_);
   return allocations_.find(buffer_start) != allocations_.end();
 }
 
 bool WasmMemoryTracker::HasFullGuardRegions(const void* buffer_start) {
-  base::LockGuard<base::Mutex> scope_lock(&mutex_);
+  base::MutexGuard scope_lock(&mutex_);
   const auto allocation = allocations_.find(buffer_start);
 
   if (allocation == allocations_.end()) {
@@ -270,17 +300,17 @@ Handle<JSArrayBuffer> SetupArrayBuffer(Isolate* isolate, void* backing_store,
   constexpr bool is_wasm_memory = true;
   JSArrayBuffer::Setup(buffer, isolate, is_external, backing_store, size,
                        shared, is_wasm_memory);
-  buffer->set_is_neuterable(false);
+  buffer->set_is_detachable(false);
   buffer->set_is_growable(true);
   return buffer;
 }
 
-MaybeHandle<JSArrayBuffer> NewArrayBuffer(Isolate* isolate, size_t size,
-                                          SharedFlag shared) {
-  // Enforce engine-limited maximum allocation size.
-  if (size > kV8MaxWasmMemoryBytes) return {};
+MaybeHandle<JSArrayBuffer> AllocateAndSetupArrayBuffer(Isolate* isolate,
+                                                       size_t size,
+                                                       size_t maximum_size,
+                                                       SharedFlag shared) {
   // Enforce flag-limited maximum allocation size.
-  if (size > (FLAG_wasm_max_mem_pages * uint64_t{kWasmPageSize})) return {};
+  if (size > max_mem_bytes()) return {};
 
   WasmMemoryTracker* memory_tracker = isolate->wasm_engine()->memory_tracker();
 
@@ -289,7 +319,8 @@ MaybeHandle<JSArrayBuffer> NewArrayBuffer(Isolate* isolate, size_t size,
   size_t allocation_length = 0;
 
   void* memory = TryAllocateBackingStore(memory_tracker, isolate->heap(), size,
-                                         &allocation_base, &allocation_length);
+                                         maximum_size, &allocation_base,
+                                         &allocation_length);
   if (memory == nullptr) return {};
 
 #if DEBUG
@@ -307,20 +338,32 @@ MaybeHandle<JSArrayBuffer> NewArrayBuffer(Isolate* isolate, size_t size,
   return SetupArrayBuffer(isolate, memory, size, is_external, shared);
 }
 
+MaybeHandle<JSArrayBuffer> NewArrayBuffer(Isolate* isolate, size_t size) {
+  return AllocateAndSetupArrayBuffer(isolate, size, size,
+                                     SharedFlag::kNotShared);
+}
+
+MaybeHandle<JSArrayBuffer> NewSharedArrayBuffer(Isolate* isolate,
+                                                size_t initial_size,
+                                                size_t max_size) {
+  return AllocateAndSetupArrayBuffer(isolate, initial_size, max_size,
+                                     SharedFlag::kShared);
+}
+
 void DetachMemoryBuffer(Isolate* isolate, Handle<JSArrayBuffer> buffer,
                         bool free_memory) {
   if (buffer->is_shared()) return;  // Detaching shared buffers is impossible.
-  DCHECK(!buffer->is_neuterable());
+  DCHECK(!buffer->is_detachable());
 
   const bool is_external = buffer->is_external();
-  DCHECK(!buffer->is_neuterable());
+  DCHECK(!buffer->is_detachable());
   if (!is_external) {
     buffer->set_is_external(true);
     isolate->heap()->UnregisterArrayBuffer(*buffer);
     if (free_memory) {
-      // We need to free the memory before neutering the buffer because
+      // We need to free the memory before detaching the buffer because
       // FreeBackingStore reads buffer->allocation_base(), which is nulled out
-      // by Neuter. This means there is a dangling pointer until we neuter the
+      // by Detach. This means there is a dangling pointer until we detach the
       // buffer. Since there is no way for the user to directly call
       // FreeBackingStore, we can ensure this is safe.
       buffer->FreeBackingStoreFromMainThread();
@@ -329,8 +372,8 @@ void DetachMemoryBuffer(Isolate* isolate, Handle<JSArrayBuffer> buffer,
 
   DCHECK(buffer->is_external());
   buffer->set_is_wasm_memory(false);
-  buffer->set_is_neuterable(true);
-  buffer->Neuter();
+  buffer->set_is_detachable(true);
+  buffer->Detach();
 }
 
 }  // namespace wasm
