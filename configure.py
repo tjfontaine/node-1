@@ -50,6 +50,8 @@ valid_arch = ('arm', 'arm64', 'ia32', 'ppc',
 valid_arm_float_abi = ('soft', 'softfp', 'hard')
 valid_arm_fpu = ('vfp', 'vfpv3', 'vfpv3-d16', 'neon')
 valid_intl_modes = ('none', 'small-icu', 'full-icu', 'system-icu')
+valid_dtrace = ('auto', 'traditional', 'mac', 'systemtap')
+
 with open ('tools/icu/icu_versions.json') as f:
   icu_versions = json.load(f)
 
@@ -369,6 +371,14 @@ parser.add_option('--with-dtrace',
     action='store_true',
     dest='with_dtrace',
     help='build with DTrace (default is true on sunos and darwin)')
+
+parser.add_option('--dtrace-mode',
+    action='store',
+    dest='dtrace_mode',
+    default='auto',
+    choices=valid_dtrace,
+    help='specifies if DTrace is traditional, macOS, or systemtap ({0}) [default: %default]'.format(
+        ', '.join(valid_dtrace)))
 
 parser.add_option('--with-etw',
     action='store_true',
@@ -977,19 +987,10 @@ def configure_node(o):
 
   o['variables']['enable_lto'] = b(options.enable_lto)
 
-  if flavor in ('solaris', 'mac', 'linux', 'freebsd'):
-    use_dtrace = not options.without_dtrace
-    # Don't enable by default on linux and freebsd
-    if flavor in ('linux', 'freebsd'):
-      use_dtrace = options.with_dtrace
-
-    if flavor == 'linux':
-      if options.systemtap_includes:
-        o['include_dirs'] += [options.systemtap_includes]
-    o['variables']['node_use_dtrace'] = b(use_dtrace)
-  elif options.with_dtrace:
-    raise Exception(
-       'DTrace is currently only supported on SunOS, MacOS or Linux systems.')
+  if flavor in ('solaris', 'mac') and not options.without_dtrace:
+    configure_dtrace(o)
+  elif flavor in ('linux', 'freebsd') and options.with_dtrace:
+    configure_dtrace(o)
   else:
     o['variables']['node_use_dtrace'] = 'false'
 
@@ -1531,6 +1532,57 @@ def make_bin_override():
   os.environ['PATH'] = bin_override + ':' + os.environ['PATH']
 
   return bin_override
+
+def configure_dtrace(o):
+  """Configure DTrace style observability based on environment
+Modes of operation:
+
+Traditional (original? legacy?) refers to how the platform was originally
+conceived, and is present on SunOS family and BSD platforms that have ported
+the functionality.
+
+Mac refers to the specialization that Apple did in porting DTrace, which avoids
+the creation of an object file, and puts everything into a header.
+
+SystemTap refers to the fact that SystemTap ships a dtrace python script to
+parse DTrace static probe points and emit a compatible SystemTap object file.
+
+Auto attempts to detect the mode of operation first by flavor/platform, and
+then if on Linux the existence of `/usr/sbin/dtrace` indicates traditional
+DTrace, while the presence of `/usr/bin/dtrace` indicates SystemTap, and if
+neither are present we warn and assume SystemTap as the user explicitly
+requested `--with-dtrace`.
+
+While these modes are implemented in a largely mutually exclusive model, the
+Linux world could be more ambiguous. Strictly speaking, one could have a binary
+with _both_ DTrace probes and SystemTap probes. If/when someone wants to
+implement such a feature, this check will need to be improved.
+"""
+
+  o['variables']['node_use_dtrace'] = 'true'
+  if options.dtrace_mode == 'auto':
+    if flavor in ('solaris', 'freebsd'):
+      o['variables']['node_dtrace_mode'] = 'traditional'
+    elif flavor == 'mac':
+      o['variables']['node_dtrace_mode'] = 'mac'
+    elif flavor == 'linux':
+      if os.path.exists('/usr/sbin/dtrace'):
+        o['variables']['node_dtrace_mode'] = 'traditional'
+      elif os.path.exists('/usr/bin/dtrace'):
+        o['variables']['node_dtrace_mode'] = 'systemtap'
+      else:
+        warn('dtrace detection on linux falling back to systemtap')
+        o['variables']['node_dtrace_mode'] = 'systemtap'
+    else:
+      raise Exception(
+        'DTrace auto detection is currently only supported on SunOS, FreeBSD, MacOS or Linux systems.')
+  else:
+    o['variables']['node_dtrace_mode'] = options.dtrace_mode
+
+
+  if o['variables']['node_dtrace_mode'] == 'systemtap':
+    if options.systemtap_includes:
+      o['include_dirs'] += [options.systemtap_includes]
 
 output = {
   'variables': {},

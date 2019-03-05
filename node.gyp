@@ -3,6 +3,9 @@
     'v8_use_snapshot%': 'false',
     'v8_trace_maps%': 0,
     'node_use_dtrace%': 'false',
+    'node_dtrace_mode%': 'traditional',
+    'node_dtrace_path%': '/usr/sbin/dtrace',
+    'node_systemtap_path%': '/usr/bin/dtrace',
     'node_use_etw%': 'false',
     'node_no_browser_globals%': 'false',
     'node_code_cache_path%': '',
@@ -672,23 +675,31 @@
           # below, and the GYP-generated Makefiles will properly build them when
           # needed.
           #
+          # node_dtrace_mode can be one of traditional, mac, and systemtap;
+          # though we never outright check for mac, as it's used to avoid being
+          # lumped in with traditional
           'sources': [
             'src/node_dtrace.h',
             'src/node_dtrace.cc',
           ],
           'conditions': [
-            [ 'OS=="linux"', {
+            [ 'node_dtrace_mode=="systemtap"', {
               'sources': [
                 '<(SHARED_INTERMEDIATE_DIR)/node_dtrace_provider.o'
               ],
             }],
-            [ 'OS!="mac" and OS!="linux"', {
+            [ 'node_dtrace_mode=="traditional"', {
               'sources': [
-                'src/node_dtrace_ustack.cc',
                 'src/node_dtrace_provider.cc',
               ]
-            }
-          ] ]
+            }],
+            ## Linux currently cannot merge two CUs each with a __SUNW_dof
+            [ 'node_dtrace_mode=="traditional" and OS!="linux"', {
+              'sources': [
+                'src/node_dtrace_ustack.cc',
+              ]
+            }],
+          ]
         } ],
         [ 'node_use_openssl=="true"', {
           'sources': [
@@ -841,24 +852,24 @@
       'target_name': 'node_dtrace_header',
       'type': 'none',
       'conditions': [
-        [ 'node_use_dtrace=="true" and OS!="linux"', {
+        [ 'node_use_dtrace=="true" and node_dtrace_mode!="systemtap"', {
           'actions': [
             {
               'action_name': 'node_dtrace_header',
               'inputs': [ 'src/node_provider.d' ],
               'outputs': [ '<(SHARED_INTERMEDIATE_DIR)/node_provider.h' ],
-              'action': [ 'dtrace', '-h', '-xnolibs', '-s', '<@(_inputs)',
+              'action': [ '<(node_dtrace_path)', '-h', '-xnolibs', '-s', '<@(_inputs)',
                 '-o', '<@(_outputs)' ]
             }
           ]
         } ],
-        [ 'node_use_dtrace=="true" and OS=="linux"', {
+        [ 'node_use_dtrace=="true" and node_dtrace_mode=="systemtap"', {
           'actions': [
             {
               'action_name': 'node_dtrace_header',
               'inputs': [ 'src/node_provider.d' ],
               'outputs': [ '<(SHARED_INTERMEDIATE_DIR)/node_provider.h' ],
-              'action': [ 'dtrace', '-h', '-s', '<@(_inputs)',
+              'action': [ '<(node_systemtap_path)', '-h', '-s', '<@(_inputs)',
                 '-o', '<@(_outputs)' ]
             }
           ]
@@ -869,7 +880,7 @@
       'target_name': 'node_dtrace_provider',
       'type': 'none',
       'conditions': [
-        [ 'node_use_dtrace=="true" and OS!="mac" and OS!="linux"', {
+        [ 'node_use_dtrace=="true" and node_dtrace_mode=="traditional"', {
           'actions': [
             {
               'action_name': 'node_dtrace_provider_o',
@@ -879,12 +890,12 @@
               'outputs': [
                 '<(obj_dir)/<(node_lib_target_name)/src/node_dtrace_provider.o'
               ],
-              'action': [ 'dtrace', '-G', '-xnolibs', '-s', 'src/node_provider.d',
+              'action': [ '<(node_dtrace_path)', '-G', '-xnolibs', '-s', 'src/node_provider.d',
                 '<@(_inputs)', '-o', '<@(_outputs)' ]
             }
           ]
         }],
-        [ 'node_use_dtrace=="true" and OS=="linux"', {
+        [ 'node_use_dtrace=="true" and node_dtrace_mode=="systemtap"', {
           'actions': [
             {
               'action_name': 'node_dtrace_provider_o',
@@ -893,7 +904,7 @@
                 '<(SHARED_INTERMEDIATE_DIR)/node_dtrace_provider.o'
               ],
               'action': [
-                'dtrace', '-C', '-G', '-s', '<@(_inputs)', '-o', '<@(_outputs)'
+                '<(node_systemtap_path)', '-C', '-G', '-s', '<@(_inputs)', '-o', '<@(_outputs)'
               ],
             }
           ],
@@ -904,7 +915,7 @@
       'target_name': 'node_dtrace_ustack',
       'type': 'none',
       'conditions': [
-        [ 'node_use_dtrace=="true" and OS!="mac" and OS!="linux"', {
+        [ 'node_use_dtrace=="true" and node_dtrace_mode=="traditional"', {
           'actions': [
             {
               'action_name': 'node_dtrace_ustack_constants',
@@ -932,13 +943,13 @@
               'conditions': [
                 [ 'target_arch=="ia32" or target_arch=="arm"', {
                   'action': [
-                    'dtrace', '-32', '-I<(SHARED_INTERMEDIATE_DIR)', '-Isrc',
+                    '<(node_dtrace_path)', '-32', '-I<(SHARED_INTERMEDIATE_DIR)', '-Isrc',
                     '-C', '-G', '-s', 'src/v8ustack.d', '-o', '<@(_outputs)',
                   ]
                 } ],
                 [ 'target_arch=="x64"', {
                   'action': [
-                    'dtrace', '-64', '-I<(SHARED_INTERMEDIATE_DIR)', '-Isrc',
+                    '<(node_dtrace_path)', '-64', '-I<(SHARED_INTERMEDIATE_DIR)', '-Isrc',
                     '-C', '-G', '-s', 'src/v8ustack.d', '-o', '<@(_outputs)',
                   ]
                 } ],
